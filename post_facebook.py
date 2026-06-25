@@ -47,7 +47,7 @@ LOOP_INTERVAL_MINUTES     = int(os.environ.get("LOOP_INTERVAL_MINUTES", 30))
 VIDEO_EXTENSIONS          = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STEP LOGGER — prints a clear numbered banner for every major step
+# STEP LOGGER
 # ─────────────────────────────────────────────────────────────────────────────
 _step = 0
 def step(msg):
@@ -77,9 +77,9 @@ def build_drive_service():
     if not creds_json:
         fail(f"Env var {GDRIVE_CREDS_ENV} is not set")
         raise RuntimeError(f"Missing {GDRIVE_CREDS_ENV}")
-    
+
     info(f"GOOGLE_CREDENTIALS_JSON length: {len(creds_json)} chars")
-    
+
     try:
         creds_data = json.loads(creds_json)
     except json.JSONDecodeError as e:
@@ -87,8 +87,7 @@ def build_drive_service():
         raise
 
     info(f"Credential keys present: {list(creds_data.keys())}")
-    
-    # Check for required fields
+
     for field in ["token", "refresh_token", "client_id", "client_secret"]:
         if creds_data.get(field):
             ok(f"  {field}: present")
@@ -125,7 +124,7 @@ def gdrive_list_videos(service, folder_id: str) -> list[dict]:
     ext_filter = " or ".join(f"name contains '{ext}'" for ext in VIDEO_EXTENSIONS)
     query = f"'{folder_id}' in parents and trashed = false and ({ext_filter})"
     info(f"Query: {query}")
-    
+
     try:
         result = service.files().list(
             q=query,
@@ -148,7 +147,7 @@ def gdrive_list_videos(service, folder_id: str) -> list[dict]:
 def gdrive_download_video(service, file_id: str, file_name: str, dest_dir: str) -> str:
     step(f"Downloading video: {file_name} (id={file_id})")
     dest_path = os.path.join(dest_dir, file_name)
-    
+
     try:
         request = service.files().get_media(fileId=file_id)
         with io.FileIO(dest_path, "wb") as fh:
@@ -158,7 +157,7 @@ def gdrive_download_video(service, file_id: str, file_name: str, dest_dir: str) 
                 status, done = downloader.next_chunk()
                 if status:
                     print(f"   📥 {int(status.progress() * 100)}%", end="\r")
-        print()  # newline after progress
+        print()
     except Exception as e:
         fail(f"Download failed: {e}")
         raise
@@ -219,11 +218,11 @@ def resolve_fb_storage_state() -> str | None:
             fail(f"FB_STORAGE_STATE is not valid JSON: {e}")
     else:
         warn("FB_STORAGE_STATE env var not set")
-    
+
     if Path(STORAGE_STATE).exists():
         info(f"Found local {STORAGE_STATE} — using it")
         return Path(STORAGE_STATE).read_text(encoding="utf-8")
-    
+
     fail("No valid Facebook session found!")
     return None
 
@@ -254,11 +253,11 @@ def is_hard_login_url(url: str) -> bool:
     return "/login" in url and not is_picker_url(url)
 
 def classify_url(url: str) -> str:
-    if "checkpoint" in url:        return "CHECKPOINT"
-    if is_hard_login_url(url):     return "LOGIN_WALL"
-    if is_picker_url(url):         return "DEVICE_PICKER"
-    if "reels/create" in url:      return "REELS_CREATE"
-    if "facebook.com" in url:      return "FACEBOOK_PAGE"
+    if "checkpoint" in url:    return "CHECKPOINT"
+    if is_hard_login_url(url): return "LOGIN_WALL"
+    if is_picker_url(url):     return "DEVICE_PICKER"
+    if "reels/create" in url:  return "REELS_CREATE"
+    if "facebook.com" in url:  return "FACEBOOK_PAGE"
     return "OTHER"
 
 
@@ -306,7 +305,6 @@ async def nuke_continue_button(page, label: str) -> bool:
     ]
     url_before = page.url
 
-    # Wait up to 10s for any button
     found_sel = None
     for _ in range(10):
         for sel in SELECTORS:
@@ -322,7 +320,6 @@ async def nuke_continue_button(page, label: str) -> bool:
 
     if not found_sel:
         warn("No Continue button found in DOM after 10s")
-        # Try JS DOM search
         try:
             hit = await page.evaluate("""() => {
                 const candidates = Array.from(document.querySelectorAll(
@@ -343,7 +340,6 @@ async def nuke_continue_button(page, label: str) -> bool:
         except Exception as e:
             warn(f"JS search failed: {e}")
 
-        # Phase 6: direct bypass
         info("Trying direct navigation bypass...")
         try:
             await page.goto("https://www.facebook.com/?sk=h_chr",
@@ -386,14 +382,12 @@ async def ensure_logged_in(page) -> bool:
 
         if url_type == "CHECKPOINT":
             fail("Account checkpoint/restriction detected — manual action required")
-            fail("Check your Facebook account for security notices")
             await save_screenshot(page, f"LOGIN_CHECKPOINT_{attempt+1}")
             await dump_html(page, f"checkpoint_{attempt+1}.html")
             return False
 
         if url_type == "LOGIN_WALL":
             fail("Hard login wall — session cookies are EXPIRED")
-            fail("You need to re-export storage_state.json from a fresh browser session")
             await save_screenshot(page, f"LOGIN_WALL_{attempt+1}")
             return False
 
@@ -407,7 +401,6 @@ async def ensure_logged_in(page) -> bool:
                 await asyncio.sleep(3)
             continue
 
-        # Check for feed elements proving we're logged in
         for sel in FEED_SELECTORS:
             try:
                 count = await page.locator(sel).count()
@@ -417,7 +410,6 @@ async def ensure_logged_in(page) -> bool:
             except Exception:
                 pass
 
-        # Check page title for clues
         try:
             title = await page.title()
             info(f"Page title: {title}")
@@ -430,6 +422,119 @@ async def ensure_logged_in(page) -> bool:
     fail("Login check exhausted all 6 attempts")
     await dump_html(page, "login_failed_final.html")
     await save_screenshot(page, "LOGIN_FAILED_FINAL")
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Caption entry — handles Lexical editor with 4 fallback strategies
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def enter_caption_lexical(page, caption: str) -> bool:
+    """Try 4 strategies to paste text into Facebook's Lexical editor."""
+    LEXICAL_SELECTORS = [
+        'div[data-lexical-editor="true"][contenteditable="true"]',
+        'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
+        'div[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"]',
+    ]
+
+    async def strategy_clipboard(field):
+        info("Strategy 1: clipboard paste via Ctrl+V")
+        await field.click(timeout=5_000)
+        await asyncio.sleep(0.4)
+        await page.keyboard.press("Control+a")
+        await asyncio.sleep(0.2)
+        await page.keyboard.press("Backspace")
+        await asyncio.sleep(0.2)
+        await page.evaluate(
+            "(text) => navigator.clipboard.writeText(text).catch(() => {})",
+            caption,
+        )
+        await asyncio.sleep(0.3)
+        await page.keyboard.press("Control+v")
+        await asyncio.sleep(0.8)
+
+    async def strategy_exec_command(field):
+        info("Strategy 2: execCommand insertText")
+        await field.click(timeout=5_000)
+        await asyncio.sleep(0.3)
+        await page.evaluate(
+            """(el, text) => {
+                el.focus();
+                document.execCommand('selectAll', false, null);
+                document.execCommand('delete', false, null);
+                document.execCommand('insertText', false, text);
+            }""",
+            [field, caption],
+        )
+        await asyncio.sleep(0.5)
+
+    async def strategy_input_event(field):
+        info("Strategy 3: InputEvent dispatch")
+        await field.click(timeout=5_000)
+        await asyncio.sleep(0.3)
+        await page.evaluate(
+            """(el, text) => {
+                el.focus();
+                const sel = window.getSelection();
+                const range = document.createRange();
+                range.selectNodeContents(el);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                const ev = new InputEvent('beforeinput', {
+                    inputType: 'insertText',
+                    data: text,
+                    bubbles: true,
+                    cancelable: true,
+                });
+                el.dispatchEvent(ev);
+                const ev2 = new InputEvent('input', {
+                    inputType: 'insertText',
+                    data: text,
+                    bubbles: true,
+                });
+                el.dispatchEvent(ev2);
+            }""",
+            [field, caption],
+        )
+        await asyncio.sleep(0.5)
+
+    async def strategy_keyboard_type(field):
+        info("Strategy 4: keyboard.type fallback")
+        await field.click(timeout=5_000)
+        await asyncio.sleep(0.3)
+        await page.keyboard.press("Control+a")
+        await asyncio.sleep(0.2)
+        await page.keyboard.press("Backspace")
+        await asyncio.sleep(0.2)
+        await page.keyboard.type(caption, delay=20)
+        await asyncio.sleep(0.5)
+
+    strategies = [
+        strategy_clipboard,
+        strategy_exec_command,
+        strategy_input_event,
+        strategy_keyboard_type,
+    ]
+
+    for i, strategy in enumerate(strategies, 1):
+        for sel in LEXICAL_SELECTORS:
+            try:
+                field = page.locator(sel).first
+                if await field.count() == 0:
+                    continue
+                await strategy(field)
+                txt = await field.evaluate(
+                    "el => (el.innerText || el.textContent || '').trim()"
+                )
+                if txt and len(txt) > 2:
+                    ok(f"Caption entered via strategy {i} / selector '{sel}' ({len(txt)} chars)")
+                    return True
+                else:
+                    warn(f"Strategy {i} / '{sel}': field empty after attempt")
+            except Exception as e:
+                warn(f"Strategy {i} / '{sel}' raised: {e}")
+
     return False
 
 
@@ -528,7 +633,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         fail(f"Page load failed: {e}")
         await save_screenshot(page, "FAIL_01_load")
         return False
-    
+
     await asyncio.sleep(8)
     info(f"Current URL after load: {page.url}")
     info(f"URL type: {classify_url(page.url)}")
@@ -551,23 +656,20 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         fail(f"Navigation to reels/create failed: {e}")
         await save_screenshot(page, "FAIL_03_nav")
         return False
-    
+
     await asyncio.sleep(8)
     info(f"Current URL: {page.url}")
     info(f"URL type: {classify_url(page.url)}")
     await save_screenshot(page, "03_reels_create")
     await dump_html(page, "03_reels_create.html")
 
-    # Check if we got redirected away from reels create
     if "reels/create" not in page.url:
         warn(f"Got redirected away from reels/create to: {page.url}")
-        warn(f"This may mean the account lacks Reels access or got a security redirect")
 
     # ── Step 4: Attach video ──────────────────────────────────────────────
     step("Attaching video file")
     uploaded = False
 
-    # Try direct file input first
     for sel in ['input[type="file"][accept*="video"]', 'input[type="file"]']:
         try:
             inp = page.locator(sel)
@@ -584,13 +686,13 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
     if not uploaded:
         info("Direct input failed — trying upload button click")
         button_selectors = [
-            ('Select video', 'div[role="button"]:has-text("Select video")'),
-            ('Upload',       'div[role="button"]:has-text("Upload")'),
-            ('Add video',    'div[role="button"]:has-text("Add video")'),
+            ('Select video',      'div[role="button"]:has-text("Select video")'),
+            ('Upload',            'div[role="button"]:has-text("Upload")'),
+            ('Add video',         'div[role="button"]:has-text("Add video")'),
             ('Select Video span', 'span:has-text("Select video")'),
-            ('aria-label Select video', '[aria-label="Select video"]'),
-            ('Add to reel', 'div[aria-label="Add to reel"]'),
-            ('from computer', 'div:has-text("Select video from computer")'),
+            ('aria-label',        '[aria-label="Select video"]'),
+            ('Add to reel',       'div[aria-label="Add to reel"]'),
+            ('from computer',     'div:has-text("Select video from computer")'),
         ]
         for btn_name, sel in button_selectors:
             el = page.locator(sel).first
@@ -614,21 +716,20 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
 
     if not uploaded:
         fail("ABORT: Could not attach video — no file input or upload button found")
-        fail("Check 04_after_upload.html to see what the page looks like")
         return False
     ok("Video attached successfully")
 
-    # Wait for video to process (up to 3 minutes)
-    step("Waiting for video to process")
-    info("Watching for Next button to become active (up to 3 min)...")
-    
+    # ── Step 5: Wait for Next button to become active ─────────────────────
+    # Facebook flow: Upload → "Edit reel" screen (trim/CC) with Next button
+    step("Waiting for Next button to become active (up to 3 min)")
+
     next_selectors = [
         'div[aria-label="Next"][role="button"]',
         'div[role="button"]:has-text("Next")',
         'span:has-text("Next")',
         'button:has-text("Next")',
     ]
-    
+
     next_ready = False
     for elapsed in range(0, 180, 5):
         for sel in next_selectors:
@@ -636,7 +737,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
                 btn = page.locator(sel).first
                 if await btn.count() > 0:
                     disabled = await btn.get_attribute("aria-disabled")
-                    info(f"[{elapsed}s] Next button found via '{sel}', aria-disabled={disabled}")
+                    info(f"[{elapsed}s] Next found via '{sel}', aria-disabled={disabled}")
                     if disabled != "true":
                         ok(f"Next button is active after {elapsed}s!")
                         next_ready = True
@@ -648,123 +749,78 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         if elapsed % 15 == 0:
             await save_screenshot(page, f"04_processing_{elapsed}s")
         await asyncio.sleep(5)
-    
+
     if not next_ready:
         warn("Next button never became active after 3 minutes")
-        warn("Video may still be processing or upload failed silently")
         await save_screenshot(page, "04_processing_timeout")
         await dump_html(page, "04_processing_timeout.html")
 
-# ── Step 6: Enter caption ─────────────────────────────────────────────
+    # ── Step 5a: Click Next (1st) — "Edit reel" → "Reel settings" ─────────
+    step("Clicking Next (1st) — Edit reel → Reel settings")
+    clicked_next1 = False
+    for sel in next_selectors:
+        try:
+            btn = page.locator(sel).first
+            if await btn.count() == 0:
+                continue
+            disabled = await btn.get_attribute("aria-disabled")
+            if disabled == "true":
+                info(f"Skipping '{sel}' — still disabled")
+                continue
+            await btn.scroll_into_view_if_needed(timeout=5_000)
+            await btn.click(timeout=10_000)
+            ok(f"First Next clicked via: {sel}")
+            clicked_next1 = True
+            break
+        except Exception as e:
+            warn(f"First Next click '{sel}' failed: {e}")
+
+    if not clicked_next1:
+        fail("Could not click first Next — aborting")
+        await save_screenshot(page, "FAIL_05a_next1")
+        return False
+
+    await asyncio.sleep(4)
+    await save_screenshot(page, "05a_after_next1")
+    info(f"URL after first Next: {page.url}")
+
+    # ── Step 5b: Wait for caption field on "Reel settings" screen ─────────
+    step("Waiting for caption field on Reel settings screen (up to 30s)")
+
+    CAPTION_SELECTORS = [
+        'div[data-lexical-editor="true"][contenteditable="true"]',
+        'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
+        'div[contenteditable="true"][role="textbox"]',
+        'div[contenteditable="true"]',
+    ]
+
+    caption_field_found = False
+    for elapsed in range(0, 30, 2):
+        for sel in CAPTION_SELECTORS:
+            try:
+                if await page.locator(sel).count() > 0:
+                    ok(f"Caption field appeared after {elapsed}s via: {sel}")
+                    caption_field_found = True
+                    break
+            except Exception:
+                pass
+        if caption_field_found:
+            break
+        if elapsed % 10 == 0:
+            info(f"Waiting for caption field... {elapsed}s")
+            await save_screenshot(page, f"05b_waiting_caption_{elapsed}s")
+        await asyncio.sleep(2)
+
+    if not caption_field_found:
+        warn("Caption field never appeared after 30s — dumping HTML for inspection")
+        await dump_html(page, "05b_no_caption_field.html")
+        await save_screenshot(page, "05b_no_caption_field")
+    else:
+        await save_screenshot(page, "05b_caption_ready")
+
+    # ── Step 6: Enter caption ─────────────────────────────────────────────
     step("Entering caption text")
     info(f"Caption to type ({len(caption)} chars): {caption[:80]}")
-
-    async def enter_caption_lexical(page, caption: str) -> bool:
-        LEXICAL_SELECTORS = [
-            'div[data-lexical-editor="true"][contenteditable="true"]',
-            'div[contenteditable="true"][aria-placeholder="Describe your reel..."]',
-            'div[contenteditable="true"][role="textbox"]',
-            'div[contenteditable="true"]',
-        ]
-
-        async def strategy_clipboard(field):
-            info("Strategy 1: clipboard paste via Ctrl+V")
-            await field.click(timeout=5_000)
-            await asyncio.sleep(0.4)
-            await page.keyboard.press("Control+a")
-            await asyncio.sleep(0.2)
-            await page.keyboard.press("Backspace")
-            await asyncio.sleep(0.2)
-            await page.evaluate(
-                "(text) => navigator.clipboard.writeText(text).catch(() => {})",
-                caption,
-            )
-            await asyncio.sleep(0.3)
-            await page.keyboard.press("Control+v")
-            await asyncio.sleep(0.8)
-
-        async def strategy_exec_command(field):
-            info("Strategy 2: execCommand insertText")
-            await field.click(timeout=5_000)
-            await asyncio.sleep(0.3)
-            await page.evaluate(
-                """(el, text) => {
-                    el.focus();
-                    document.execCommand('selectAll', false, null);
-                    document.execCommand('delete', false, null);
-                    document.execCommand('insertText', false, text);
-                }""",
-                [field, caption],
-            )
-            await asyncio.sleep(0.5)
-
-        async def strategy_input_event(field):
-            info("Strategy 3: InputEvent dispatch")
-            await field.click(timeout=5_000)
-            await asyncio.sleep(0.3)
-            await page.evaluate(
-                """(el, text) => {
-                    el.focus();
-                    const sel = window.getSelection();
-                    const range = document.createRange();
-                    range.selectNodeContents(el);
-                    sel.removeAllRanges();
-                    sel.addRange(range);
-                    const ev = new InputEvent('beforeinput', {
-                        inputType: 'insertText',
-                        data: text,
-                        bubbles: true,
-                        cancelable: true,
-                    });
-                    el.dispatchEvent(ev);
-                    const ev2 = new InputEvent('input', {
-                        inputType: 'insertText',
-                        data: text,
-                        bubbles: true,
-                    });
-                    el.dispatchEvent(ev2);
-                }""",
-                [field, caption],
-            )
-            await asyncio.sleep(0.5)
-
-        async def strategy_keyboard_type(field):
-            info("Strategy 4: keyboard.type fallback")
-            await field.click(timeout=5_000)
-            await asyncio.sleep(0.3)
-            await page.keyboard.press("Control+a")
-            await asyncio.sleep(0.2)
-            await page.keyboard.press("Backspace")
-            await asyncio.sleep(0.2)
-            await page.keyboard.type(caption, delay=20)
-            await asyncio.sleep(0.5)
-
-        strategies = [
-            strategy_clipboard,
-            strategy_exec_command,
-            strategy_input_event,
-            strategy_keyboard_type,
-        ]
-
-        for i, strategy in enumerate(strategies, 1):
-            for sel in LEXICAL_SELECTORS:
-                try:
-                    field = page.locator(sel).first
-                    if await field.count() == 0:
-                        continue
-                    await strategy(field)
-                    txt = await field.evaluate(
-                        "el => (el.innerText || el.textContent || '').trim()"
-                    )
-                    if txt and len(txt) > 2:
-                        ok(f"Caption entered via strategy {i} / selector '{sel}' ({len(txt)} chars)")
-                        return True
-                    else:
-                        warn(f"Strategy {i} / '{sel}': field empty after attempt")
-                except Exception as e:
-                    warn(f"Strategy {i} / '{sel}' raised: {e}")
-
-        return False
 
     caption_ok = await enter_caption_lexical(page, caption)
 
@@ -772,37 +828,57 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         warn("Caption could not be entered — continuing anyway (post may have no caption)")
     await save_screenshot(page, "06_after_caption")
 
-    # ── Step 7: Click Next again → then Post ─────────────────────────────
-    step("Clicking Next (2nd time) to reach Post panel")
+    # ── Step 7: Click Next (2nd) — "Reel settings" → confirm/post panel ───
+    step("Clicking Next (2nd) — Reel settings → Post panel")
+
+    # On Reel settings the button may be labelled "Next" or go straight to "Post"
+    # Wait up to 10s for either
+    post_or_next_selectors = [
+        'div[aria-label="Post"][role="button"]',
+        'div[role="button"]:text-is("Post")',
+        'div[aria-label="Next"][role="button"]',
+        'div[role="button"]:has-text("Next")',
+        'span:text-is("Post")',
+        'span:has-text("Next")',
+        'button:has-text("Post")',
+        'button:has-text("Next")',
+    ]
+
     clicked_next2 = False
-    for sel in next_selectors:
+    for sel in post_or_next_selectors:
         try:
             btn = page.locator(sel).last
             if await btn.count() == 0:
                 continue
             disabled = await btn.get_attribute("aria-disabled")
             if disabled == "true":
+                info(f"Skipping '{sel}' — disabled")
                 continue
+            label_text = await btn.inner_text()
+            info(f"Found button '{sel}' with text: {label_text!r}")
+            await btn.scroll_into_view_if_needed(timeout=5_000)
             await btn.click(force=True)
-            ok(f"Second Next clicked via: {sel}")
+            ok(f"Clicked '{label_text.strip()}' button via: {sel}")
             clicked_next2 = True
             await asyncio.sleep(4)
             break
         except Exception as e:
-            warn(f"Second Next '{sel}' failed: {e}")
+            warn(f"Button '{sel}' failed: {e}")
 
     if not clicked_next2:
-        warn("Could not click second Next — may already be on Post panel")
-    
+        warn("Could not click second Next/Post — may already be on Post panel or button changed")
+
     await save_screenshot(page, "07_before_post")
     await dump_html(page, "07_before_post.html")
+    info(f"URL after second Next: {page.url}")
 
-    # ── Step 8: Click Post/Publish ─────────────────────────────────────
+    # ── Step 8: Click Post/Publish ────────────────────────────────────────
     step("Clicking Post / Publish button")
+
     post_selectors = [
         ("aria-label Post",    'div[aria-label="Post"][role="button"]'),
         ("text Post exact",    'div[role="button"]:text-is("Post")'),
-        ("span Post",          'span:text-is("Post")'),
+        ("span Post exact",    'span:text-is("Post")'),
         ("aria-label Publish", 'div[aria-label="Publish"][role="button"]'),
         ("aria-label Share",   'div[aria-label="Share now"][role="button"]'),
         ("text Post",          'div[role="button"]:has-text("Post")'),
@@ -810,6 +886,26 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         ("text Share now",     'div[role="button"]:has-text("Share now")'),
         ("submit button",      'button[type="submit"]'),
     ]
+
+    # Wait up to 10s for the Post button to appear
+    post_btn_found = False
+    for wait_elapsed in range(0, 10, 2):
+        for sel_name, sel in post_selectors:
+            try:
+                count = await page.locator(sel).count()
+                if count > 0:
+                    info(f"Post button '{sel_name}' visible after {wait_elapsed}s")
+                    post_btn_found = True
+                    break
+            except Exception:
+                pass
+        if post_btn_found:
+            break
+        info(f"Waiting for Post button... {wait_elapsed}s")
+        await asyncio.sleep(2)
+
+    if not post_btn_found:
+        warn("Post button not yet visible — attempting click anyway")
 
     post_clicked = False
     for sel_name, sel in post_selectors:
@@ -823,7 +919,6 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
             if disabled == "true":
                 warn(f"  '{sel_name}' is disabled — skipping")
                 continue
-            
             await btn.scroll_into_view_if_needed(timeout=5_000)
             await btn.click(force=True)
             ok(f"Post button clicked via: {sel_name}")
@@ -841,6 +936,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
 
     # ── Step 9: Wait for confirmation ─────────────────────────────────────
     step("Waiting for publish confirmation (up to 60s)")
+
     confirm_selectors = [
         'span:has-text("Your reel is now shared")',
         'span:has-text("Reel posted")',
@@ -849,7 +945,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         'div:has-text("Your reel was shared")',
         'span:has-text("shared")',
     ]
-    
+
     for elapsed in range(0, 60, 5):
         for sel in confirm_selectors:
             try:
@@ -867,8 +963,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         await asyncio.sleep(5)
 
     if not published:
-        # Infer from page state
-        info("No explicit confirmation found — checking page state...")
+        info("No explicit confirmation — checking page state...")
         try:
             url_after = page.url
             title_after = await page.title()
@@ -876,8 +971,7 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
             info(f"Final title: {title_after}")
         except Exception:
             pass
-        
-        # If Post panel is gone and we're not on an error page, assume success
+
         try:
             post_panel_gone = await page.locator('div[aria-label="Post"][role="button"]').count() == 0
             info(f"Post panel gone: {post_panel_gone}")
@@ -911,7 +1005,6 @@ def run_once():
     print(f"  PID: {os.getpid()}")
     print(f"{'='*60}")
 
-    # Print all relevant env vars (masked)
     step("Checking environment variables")
     for var in [UPLOAD_FOLDER_ENV, UPLOADED_FOLDER_ENV, "LOOP_INTERVAL_MINUTES", "CAPTIONS_FILE_ID"]:
         val = os.environ.get(var, "")
@@ -930,14 +1023,12 @@ def run_once():
         fail(f"{UPLOADED_FOLDER_ENV} is not set — cannot continue")
         return
 
-    # Build Drive service
     try:
         service = build_drive_service()
     except Exception as e:
         fail(f"Drive service failed: {e}")
         return
 
-    # Get caption
     caption = gdrive_get_caption(service)
     if not caption:
         cap_path = Path(CAPTIONS_TXT)
@@ -948,7 +1039,6 @@ def run_once():
             caption = "Check out my latest reel! #reels #viral"
             info(f"Using default caption: {caption}")
 
-    # List videos
     try:
         videos = gdrive_list_videos(service, upload_folder)
     except Exception as e:
