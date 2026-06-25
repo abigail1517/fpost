@@ -755,37 +755,11 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         await save_screenshot(page, "04_processing_timeout")
         await dump_html(page, "04_processing_timeout.html")
 
-    # ── Step 5a: Click Next (1st) — "Edit reel" → "Reel settings" ─────────
-    step("Clicking Next (1st) — Edit reel → Reel settings")
-    clicked_next1 = False
-    for sel in next_selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.count() == 0:
-                continue
-            disabled = await btn.get_attribute("aria-disabled")
-            if disabled == "true":
-                info(f"Skipping '{sel}' — still disabled")
-                continue
-            await btn.scroll_into_view_if_needed(timeout=5_000)
-            await btn.click(timeout=10_000)
-            ok(f"First Next clicked via: {sel}")
-            clicked_next1 = True
-            break
-        except Exception as e:
-            warn(f"First Next click '{sel}' failed: {e}")
-
-    if not clicked_next1:
-        fail("Could not click first Next — aborting")
-        await save_screenshot(page, "FAIL_05a_next1")
-        return False
-
-    await asyncio.sleep(4)
-    await save_screenshot(page, "05a_after_next1")
-    info(f"URL after first Next: {page.url}")
-
-    # ── Step 5b: Wait for caption field on "Reel settings" screen ─────────
-    step("Waiting for caption field on Reel settings screen (up to 30s)")
+    # ── Step 5a/5b: Click Next until caption field appears ────────────────
+    # Facebook shows 1–2 intermediate screens before "Reel settings" where
+    # the caption lives.  We keep clicking Next (up to 3 times) until the
+    # Lexical caption field is visible.
+    step("Clicking Next until caption field appears (up to 3 clicks)")
 
     CAPTION_SELECTORS = [
         'div[data-lexical-editor="true"][contenteditable="true"]',
@@ -794,25 +768,67 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         'div[contenteditable="true"]',
     ]
 
-    caption_field_found = False
-    for elapsed in range(0, 30, 2):
+    async def caption_field_visible() -> bool:
         for sel in CAPTION_SELECTORS:
             try:
                 if await page.locator(sel).count() > 0:
-                    ok(f"Caption field appeared after {elapsed}s via: {sel}")
-                    caption_field_found = True
-                    break
+                    return True
             except Exception:
                 pass
+        return False
+
+    async def click_next_btn() -> bool:
+        for sel in next_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.count() == 0:
+                    continue
+                disabled = await btn.get_attribute("aria-disabled")
+                if disabled == "true":
+                    continue
+                await btn.scroll_into_view_if_needed(timeout=5_000)
+                await btn.click(timeout=10_000)
+                ok(f"Next clicked via: {sel}")
+                return True
+            except Exception as e:
+                warn(f"Next click '{sel}' failed: {e}")
+        return False
+
+    caption_field_found = False
+    for next_attempt in range(1, 4):          # try up to 3 Next clicks
+        info(f"Next-click attempt {next_attempt}/3")
+
+        # First check if caption field is already on screen
+        if await caption_field_visible():
+            ok(f"Caption field already visible before click {next_attempt}")
+            caption_field_found = True
+            break
+
+        # Click Next
+        clicked = await click_next_btn()
+        if not clicked:
+            warn(f"Could not find an active Next button on attempt {next_attempt}")
+            await save_screenshot(page, f"05_no_next_{next_attempt}")
+            break
+
+        await save_screenshot(page, f"05_after_next{next_attempt}")
+        info(f"URL after Next click {next_attempt}: {page.url}")
+
+        # Wait up to 15s for caption field to appear
+        for elapsed in range(0, 15, 2):
+            if await caption_field_visible():
+                ok(f"Caption field appeared {elapsed}s after Next click {next_attempt}")
+                caption_field_found = True
+                break
+            await asyncio.sleep(2)
+
         if caption_field_found:
             break
-        if elapsed % 10 == 0:
-            info(f"Waiting for caption field... {elapsed}s")
-            await save_screenshot(page, f"05b_waiting_caption_{elapsed}s")
-        await asyncio.sleep(2)
+
+        info(f"Caption field not visible after Next click {next_attempt} — trying another Next")
 
     if not caption_field_found:
-        warn("Caption field never appeared after 30s — dumping HTML for inspection")
+        warn("Caption field never appeared after 3 Next clicks — dumping HTML for inspection")
         await dump_html(page, "05b_no_caption_field.html")
         await save_screenshot(page, "05b_no_caption_field")
     else:
@@ -828,45 +844,60 @@ async def _run_upload_flow(context, caption: str, video_path: str) -> bool:
         warn("Caption could not be entered — continuing anyway (post may have no caption)")
     await save_screenshot(page, "06_after_caption")
 
-    # ── Step 7: Click Next (2nd) — "Reel settings" → confirm/post panel ───
-    step("Clicking Next (2nd) — Reel settings → Post panel")
+    # ── Step 7: Advance to Post panel if needed ───────────────────────────
+    # If Post button is already visible we don't need another Next click.
+    step("Advancing to Post panel (clicking Next if Post not yet visible)")
 
-    # On Reel settings the button may be labelled "Next" or go straight to "Post"
-    # Wait up to 10s for either
-    post_or_next_selectors = [
-        'div[aria-label="Post"][role="button"]',
-        'div[role="button"]:text-is("Post")',
-        'div[aria-label="Next"][role="button"]',
-        'div[role="button"]:has-text("Next")',
-        'span:text-is("Post")',
-        'span:has-text("Next")',
-        'button:has-text("Post")',
-        'button:has-text("Next")',
-    ]
+    async def post_button_visible() -> bool:
+        for sel in [
+            'div[aria-label="Post"][role="button"]',
+            'div[role="button"]:text-is("Post")',
+            'span:text-is("Post")',
+        ]:
+            try:
+                if await page.locator(sel).count() > 0:
+                    return True
+            except Exception:
+                pass
+        return False
 
-    clicked_next2 = False
-    for sel in post_or_next_selectors:
-        try:
-            btn = page.locator(sel).last
-            if await btn.count() == 0:
-                continue
-            disabled = await btn.get_attribute("aria-disabled")
-            if disabled == "true":
-                info(f"Skipping '{sel}' — disabled")
-                continue
-            label_text = await btn.inner_text()
-            info(f"Found button '{sel}' with text: {label_text!r}")
-            await btn.scroll_into_view_if_needed(timeout=5_000)
-            await btn.click(force=True)
-            ok(f"Clicked '{label_text.strip()}' button via: {sel}")
-            clicked_next2 = True
-            await asyncio.sleep(4)
-            break
-        except Exception as e:
-            warn(f"Button '{sel}' failed: {e}")
+    if await post_button_visible():
+        ok("Post button already visible — skipping extra Next click")
+    else:
+        # Click Next (or Post if labelled that way) to advance
+        post_or_next_selectors = [
+            'div[aria-label="Post"][role="button"]',
+            'div[role="button"]:text-is("Post")',
+            'div[aria-label="Next"][role="button"]',
+            'div[role="button"]:has-text("Next")',
+            'span:text-is("Post")',
+            'span:has-text("Next")',
+            'button:has-text("Post")',
+            'button:has-text("Next")',
+        ]
+        clicked_next2 = False
+        for sel in post_or_next_selectors:
+            try:
+                btn = page.locator(sel).last
+                if await btn.count() == 0:
+                    continue
+                disabled = await btn.get_attribute("aria-disabled")
+                if disabled == "true":
+                    info(f"Skipping '{sel}' — disabled")
+                    continue
+                label_text = await btn.inner_text()
+                info(f"Found button '{sel}' with text: {label_text!r}")
+                await btn.scroll_into_view_if_needed(timeout=5_000)
+                await btn.click(force=True)
+                ok(f"Clicked '{label_text.strip()}' via: {sel}")
+                clicked_next2 = True
+                await asyncio.sleep(4)
+                break
+            except Exception as e:
+                warn(f"Button '{sel}' failed: {e}")
 
-    if not clicked_next2:
-        warn("Could not click second Next/Post — may already be on Post panel or button changed")
+        if not clicked_next2:
+            warn("Could not click Next/Post — attempting Post step anyway")
 
     await save_screenshot(page, "07_before_post")
     await dump_html(page, "07_before_post.html")
