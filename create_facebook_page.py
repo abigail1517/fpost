@@ -451,7 +451,32 @@ async def create_page(page_name: str, category: str) -> bool:
 async def _run_create_flow(context, page_name: str, category: str) -> bool:
     page = await context.new_page()
 
+    # ── Network diagnostics ─────────────────────────────────────────────────
+    # The previous run showed "Create Page" click registering but the button
+    # then spinning forever with no success/error UI. That's invisible in the
+    # DOM — the only way to see what's really happening is to watch the
+    # actual network calls Facebook makes when the button is clicked.
+    network_log = []
+
+    def on_request(req):
+        if any(k in req.url for k in ["pages/creation", "graphql", "api/graphql", "CometPage"]):
+            network_log.append(f"[REQ ] {req.method} {req.url[:180]}")
+
+    def on_response(resp):
+        if any(k in resp.url for k in ["pages/creation", "graphql", "api/graphql", "CometPage"]):
+            network_log.append(f"[RESP] {resp.status} {resp.url[:180]}")
+
+    def on_requestfailed(req):
+        if any(k in req.url for k in ["pages/creation", "graphql", "api/graphql", "CometPage"]):
+            failure = req.failure
+            network_log.append(f"[FAIL] {req.method} {req.url[:180]} — {failure}")
+
+    page.on("request", on_request)
+    page.on("response", on_response)
+    page.on("requestfailed", on_requestfailed)
+
     # ── Step 1: Load Facebook home, confirm login ──────────────────────────
+
     step("Loading Facebook homepage")
     try:
         resp = await page.goto("https://www.facebook.com/", wait_until="domcontentloaded", timeout=60_000)
@@ -575,14 +600,22 @@ async def _run_create_flow(context, page_name: str, category: str) -> bool:
     await save_screenshot(page, "06_after_category_select")
     await dump_html(page, "06_after_category_select.html")
 
-    # ── Step 5: Click "Next" repeatedly until page is created ─────────────
-    step("Clicking Next / Create Page repeatedly until finished")
+    # ── Step 5: Click "Create Page" ONCE, then watch what actually happens ─
+    step("Clicking Create Page and watching the real network response")
 
     DONE_SELECTORS = [
         'span:has-text("Your Page is ready")',
         'span:has-text("Page created")',
         'div:has-text("Your Page was created")',
         'span:has-text("was created")',
+    ]
+
+    ERROR_TEXT_SNIPPETS = [
+        "something went wrong", "try again later", "please try again",
+        "temporarily blocked", "temporarily restricted", "unusual activity",
+        "we restrict certain content", "verify your identity",
+        "confirm your identity", "action blocked", "couldn't create",
+        "could not create", "limit", "not available right now",
     ]
 
     async def is_done() -> bool:
@@ -592,44 +625,105 @@ async def _run_create_flow(context, page_name: str, category: str) -> bool:
                     return True
             except Exception:
                 pass
-        # Also treat navigation to a real page id URL as success
         if "/pages/creation" not in page.url and "pages/" in page.url:
             return True
         return False
 
-    NEXT_LABELS = ["Next", "Create Page", "Create page", "Done", "Save", "Continue", "Finish"]
+    async def find_error_text() -> str | None:
+        try:
+            body_text = (await page.locator("body").inner_text()).lower()
+        except Exception:
+            return None
+        for snippet in ERROR_TEXT_SNIPPETS:
+            if snippet in body_text:
+                return snippet
+        return None
 
-    max_clicks = 8
+    async def button_is_spinning(sel: str) -> bool:
+        """Detect a disabled/aria-busy button or one containing a spinner svg."""
+        try:
+            btn = page.locator(sel).last
+            if await btn.count() == 0:
+                return False
+            disabled = await btn.get_attribute("aria-disabled")
+            busy = await btn.get_attribute("aria-busy")
+            has_spinner = await btn.evaluate(
+                "el => !!el.querySelector('svg, [role=\"progressbar\"], [class*=\"spinner\" i]')"
+            )
+            return disabled == "true" or busy == "true" or has_spinner
+        except Exception:
+            return False
+
+    NEXT_LABELS = ["Create Page", "Create page", "Next", "Done", "Save", "Continue", "Finish"]
+    CREATE_BTN_SELECTORS = [
+        'div[aria-label="Create Page"][role="button"]',
+        'div[role="button"]:text-is("Create Page")',
+    ]
+
     finished = False
-    for attempt in range(1, max_clicks + 1):
-        info(f"Next-loop attempt {attempt}/{max_clicks} — URL: {page.url}")
 
-        if await is_done():
-            ok(f"Detected completion before click {attempt}")
-            finished = True
-            break
-
+    if await is_done():
+        ok("Detected completion before any click — page already created")
+        finished = True
+    else:
         clicked, which = await find_and_click_button(page, NEXT_LABELS)
-        await save_screenshot(page, f"07_next_click_{attempt}")
-        await dump_html(page, f"07_next_click_{attempt}.html")
+        await save_screenshot(page, "07_immediately_after_click")
+        await dump_html(page, "07_immediately_after_click.html")
 
         if not clicked:
-            warn(f"No clickable Next/Create button found on attempt {attempt}")
-            # give any lazy-loaded UI a moment, then try once more
-            await asyncio.sleep(3)
-            clicked, which = await find_and_click_button(page, NEXT_LABELS)
-            if not clicked:
-                warn("Still no button found — stopping loop")
-                break
+            fail("Could not find/click Create Page button at all")
+        else:
+            info(f"Clicked '{which}' — now polling for up to 90s instead of re-clicking")
+            info("(Re-clicking a submitting button can trigger duplicate/conflicting "
+                 "requests, so we only click once and then observe.)")
 
-        info(f"Clicked '{which}' on attempt {attempt} — waiting for UI to update")
-        await asyncio.sleep(4)
-        info(f"URL after click: {page.url}  (type={classify_url(page.url)})")
+            for elapsed in range(0, 90, 5):
+                await asyncio.sleep(5)
+                url_now = page.url
+                spinning = False
+                for sel in CREATE_BTN_SELECTORS:
+                    if await button_is_spinning(sel):
+                        spinning = True
+                        break
 
-        if await is_done():
-            ok(f"Detected completion after click {attempt}")
-            finished = True
-            break
+                err = await find_error_text()
+                info(f"[{elapsed+5}s] URL={url_now}  spinning={spinning}  error_text={err!r}")
+
+                if elapsed % 20 == 0:
+                    await save_screenshot(page, f"07_watch_{elapsed+5}s")
+
+                if await is_done():
+                    ok(f"Detected completion after {elapsed+5}s")
+                    finished = True
+                    break
+
+                if err:
+                    fail(f"Facebook showed an error message: '{err}'")
+                    await save_screenshot(page, "FAIL_error_message")
+                    await dump_html(page, "FAIL_error_message.html")
+                    break
+
+                if not spinning and elapsed >= 10:
+                    # Button stopped spinning but we're not "done" — something
+                    # resolved (maybe silently). Give it one more short look.
+                    info("Spinner cleared without a recognized success state — checking once more")
+                    await asyncio.sleep(3)
+                    if await is_done():
+                        ok("Detected completion on final check")
+                        finished = True
+                    break
+
+            if not finished:
+                warn(f"Still not confirmed done after {elapsed+5}s of polling")
+
+    if network_log:
+        step("Network activity captured during Create Page flow")
+        for line in network_log[-40:]:   # last 40 entries, most relevant
+            info(line)
+    else:
+        warn("No matching network requests captured (graphql/pages-creation) — "
+             "the button click may not have actually fired a request at all")
+
 
     await save_screenshot(page, "08_final_state")
     await dump_html(page, "08_final_state.html")
