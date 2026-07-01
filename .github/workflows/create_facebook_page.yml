@@ -1,0 +1,60 @@
+name: Create Facebook Page
+
+on:
+  workflow_dispatch:
+    inputs:
+      page_name:
+        description: "Name of the Page to create"
+        required: false
+        default: "Live Chef"
+      page_category:
+        description: "Category to select"
+        required: false
+        default: "Food"
+
+jobs:
+  create-page:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      FB_STORAGE_STATE: ${{ secrets.FB_STORAGE_STATE }}
+      PAGE_NAME: ${{ github.event.inputs.page_name }}
+      PAGE_CATEGORY: ${{ github.event.inputs.page_category }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+
+      - name: Run Page creation script
+        run: python -u create_facebook_page.py
+
+      - name: Upload debug artifacts (screenshots + HTML dumps)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fb-page-creation-debug
+          path: |
+            screenshots/**
+            *.png
+            *.html
+          if-no-files-found: ignore
+          retention-days: 5
+
+      - name: Upload refreshed storage_state
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: refreshed-storage-state
+          path: storage_state.json
+          if-no-files-found: ignore
