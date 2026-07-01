@@ -213,6 +213,140 @@ async def try_click_text_option(page, text: str, label: str) -> bool:
     return False
 
 
+CATEGORY_SELECTORS = [
+    'input[aria-label="Category (required)"]',
+    'input[role="combobox"][aria-label*="Category"]',
+    'input[aria-label*="Category"]',
+    'input[aria-label*="category"]',
+]
+
+
+async def _read_value(field) -> str:
+    try:
+        return await field.evaluate("el => el.value || ''")
+    except Exception:
+        return ""
+
+
+async def enter_category_multi_strategy(page, category: str) -> tuple[bool, object]:
+    """Try several strategies to get text into Facebook's category combobox
+    and return (success, field_locator). Verifies el.value after each try."""
+
+    field = None
+    used_sel = None
+    for sel in CATEGORY_SELECTORS:
+        try:
+            loc = page.locator(sel).first
+            count = await loc.count()
+            info(f"[Category] selector '{sel}': {count} found")
+            if count > 0:
+                field = loc
+                used_sel = sel
+                break
+        except Exception as e:
+            warn(f"[Category] selector '{sel}' raised: {e}")
+
+    if field is None:
+        fail("[Category] No category input found with any selector")
+        return False, None
+
+    info(f"[Category] Using field via: {used_sel}")
+
+    async def clear_field():
+        try:
+            await field.click(timeout=5_000)
+            await asyncio.sleep(0.2)
+            await page.keyboard.press("Control+a")
+            await page.keyboard.press("Backspace")
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            warn(f"[Category] clear_field failed: {e}")
+
+    async def strategy_keyboard_type():
+        info("[Category] Strategy 1: click + keyboard.type")
+        await clear_field()
+        await page.keyboard.type(category, delay=100)
+        await asyncio.sleep(0.5)
+
+    async def strategy_press_sequentially():
+        info("[Category] Strategy 2: locator.press_sequentially")
+        await clear_field()
+        try:
+            await field.press_sequentially(category, delay=100)
+        except Exception as e:
+            warn(f"[Category] press_sequentially unavailable/failed: {e}")
+        await asyncio.sleep(0.5)
+
+    async def strategy_native_setter():
+        info("[Category] Strategy 3: native value setter + input/change events")
+        try:
+            await field.click(timeout=5_000)
+        except Exception:
+            pass
+        await page.evaluate(
+            """([el, text]) => {
+                const setter = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype, 'value'
+                ).set;
+                setter.call(el, '');
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                setter.call(el, text);
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }""",
+            [await field.element_handle(), category],
+        )
+        await asyncio.sleep(0.5)
+
+    async def strategy_exec_command():
+        info("[Category] Strategy 4: focus + execCommand insertText")
+        await clear_field()
+        await page.evaluate(
+            """([el, text]) => {
+                el.focus();
+                document.execCommand('insertText', false, text);
+            }""",
+            [await field.element_handle(), category],
+        )
+        await asyncio.sleep(0.5)
+
+    async def strategy_char_by_char_press():
+        info("[Category] Strategy 5: per-character keyboard.press")
+        await clear_field()
+        for ch in category:
+            try:
+                await page.keyboard.press(ch if ch != " " else "Space")
+            except Exception:
+                await page.keyboard.type(ch)
+            await asyncio.sleep(0.06)
+        await asyncio.sleep(0.5)
+
+    strategies = [
+        strategy_keyboard_type,
+        strategy_press_sequentially,
+        strategy_native_setter,
+        strategy_exec_command,
+        strategy_char_by_char_press,
+    ]
+
+    for i, strat in enumerate(strategies, 1):
+        try:
+            await strat()
+        except Exception as e:
+            warn(f"[Category] strategy {i} raised: {e}")
+            continue
+        val = await _read_value(field)
+        info(f"[Category] value after strategy {i}: {val!r}")
+        if val.strip():
+            ok(f"[Category] Successfully entered text via strategy {i}")
+            return True, field
+        else:
+            warn(f"[Category] Strategy {i} left field empty — trying next")
+
+    fail("[Category] All 5 strategies failed to put text into the field")
+    return False, field
+
+
 async def find_and_click_button(page, labels: list[str]) -> tuple[bool, str]:
     """Try to click a button/div[role=button] matching any of the given labels."""
     for label_text in labels:
@@ -368,31 +502,74 @@ async def _run_create_flow(context, page_name: str, category: str) -> bool:
         await dump_html(page, "04_no_name_field.html")
 
     # ── Step 4: Fill / select Category ─────────────────────────────────────
+    # NOTE: Facebook's actual DOM uses aria-label="Category (required)"
+    # (confirmed from HTML dump) and is a controlled React combobox, so
+    # plain .fill() silently fails. enter_category_multi_strategy() tries
+    # 5 different input methods and verifies el.value after each one.
     step("Filling Page category field")
-    CATEGORY_INPUT_SELECTORS = [
-        'input[aria-label="Category"]',
-        'input[placeholder*="Category"]',
-        'input[aria-label*="category"]',
-    ]
-    cat_field_ok = await try_fill(page, CATEGORY_INPUT_SELECTORS, category, "Category")
+    cat_field_ok, cat_field = await enter_category_multi_strategy(page, category)
+
     await save_screenshot(page, "05_after_category_type")
+    await dump_html(page, "05_after_category_type.html")
 
     if cat_field_ok:
-        # wait for the dropdown options to render, then click the "Food" option
-        info("Waiting for category dropdown options to appear")
-        await asyncio.sleep(2)
+        info("Waiting for category dropdown options to render")
+        options_appeared = False
+        for elapsed in range(0, 8):
+            for probe_sel in [
+                '[role="listbox"]', '[role="option"]',
+                'ul[role="listbox"] li', 'div[role="option"]',
+                'div[aria-expanded="true"]',
+            ]:
+                try:
+                    if await page.locator(probe_sel).count() > 0:
+                        options_appeared = True
+                        info(f"Dropdown detected via '{probe_sel}' after {elapsed}s")
+                        break
+                except Exception:
+                    pass
+            if options_appeared:
+                break
+            await asyncio.sleep(1)
+
+        await save_screenshot(page, "05b_dropdown_state")
+        await dump_html(page, "05b_dropdown_state.html")
+
+        if not options_appeared:
+            warn("No dropdown options detected in DOM after 8s — will still try clicking / keyboard fallback")
+
         picked = await try_click_text_option(page, category, "Category option")
+
         if not picked:
-            warn(f"Could not click a dropdown option matching '{category}' — trying Enter key")
+            warn(f"No option matched '{category}' text — trying broader option-role click")
+            for generic_sel in ['[role="option"]', 'div[role="option"]', 'li[role="option"]']:
+                try:
+                    opt = page.locator(generic_sel).first
+                    if await opt.count() > 0:
+                        await opt.click(timeout=5_000, force=True)
+                        ok(f"Clicked first available option via '{generic_sel}'")
+                        picked = True
+                        break
+                except Exception as e:
+                    warn(f"Generic option click '{generic_sel}' failed: {e}")
+
+        if not picked:
+            warn("Still no option clicked — trying ArrowDown+Enter keyboard select")
             try:
+                if cat_field is not None:
+                    await cat_field.click(timeout=5_000)
                 await page.keyboard.press("ArrowDown")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.5)
                 await page.keyboard.press("Enter")
                 ok("Pressed ArrowDown+Enter to accept first suggestion")
+                picked = True
             except Exception as e:
                 warn(f"Keyboard fallback failed: {e}")
+
+        if not picked:
+            fail("Could not select ANY category option — Create Page button will likely stay disabled")
     else:
-        warn("Could not find a category input field — dumping HTML for inspection")
+        warn("Could not fill category field with any strategy — dumping HTML for inspection")
         await dump_html(page, "05_no_category_field.html")
 
     await save_screenshot(page, "06_after_category_select")
